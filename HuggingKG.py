@@ -2,8 +2,9 @@ import concurrent.futures
 import json
 import logging
 import os
-from datetime import datetime
-from neo4j import GraphDatabase
+import time
+from datetime import datetime, date
+from auth import token
 import requests
 from huggingface_hub import (get_dataset_tags, get_model_tags, list_datasets,
                              list_models, list_spaces, login, logout)
@@ -13,33 +14,37 @@ from urllib3 import Retry
 
 
 class KGConstructor:
-    def __init__(self):
+    # Rate limiting: 1000 requests per 5 minutes (300 seconds)
+    API_RATE_LIMIT = 1000
+    API_WINDOW_SECONDS = 300
+    BATCH_SIZE = 500  # Write to file every 500 entities
+    
+    def __init__(self, previous_data_dir=None, cutoff_date=None):
+        self.previous_data_dir = previous_data_dir
+        self.cutoff_date = cutoff_date
+        if cutoff_date:
+            self.cutoff_datetime = self._parse_datetime(cutoff_date)
+        else:
+            self.cutoff_datetime = None
         self.setup_environment()
         self.init_data_structures()
-        
         self.setup_session()
-
-    def setup_neo4j_connection(self):
-        """Setup connection to local Neo4j instance"""
-        try:
-            self.neo4j_uri = "bolt://localhost:7687"
-            self.neo4j_user = "neo4j"
-            self.neo4j_password = "01234567"  # Change this to your Neo4j password
-            self.driver = GraphDatabase.driver(self.neo4j_uri, auth=(self.neo4j_user, self.neo4j_password))
-            # Test connection
-            with self.driver.session() as session:
-                session.run("RETURN 1")
-            logging.info("[neo4j] Successfully connected to Neo4j at " + self.neo4j_uri)
-        except Exception as e:
-            logging.error(f"[neo4j] Failed to connect to Neo4j: {e}")
-            self.driver = None
+        # Rate limiting tracking
+        self.api_requests = 0
+        self.rate_limit_start = time.time()
+        # Load previous data if provided
+        if self.previous_data_dir:
+            self.load_previous_data()
 
     def setup_environment(self):
         """Setup environment variables and logging"""
-        self.my_hf_token = "" # Add your Hugging Face API token here
+        self.my_hf_token = token  # Use the token from auth.py
         login(token=self.my_hf_token)
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-        self.output_dir = "HuggingKG_V"+timestamp
+        if self.previous_data_dir:
+            self.output_dir = self.previous_data_dir + "_updated_" + timestamp
+        else:
+            self.output_dir = "HuggingKG_V"+timestamp
         os.makedirs(self.output_dir, exist_ok=True)
         logging.basicConfig(
             filename=os.path.join(self.output_dir, 'logs.log'), 
@@ -131,10 +136,142 @@ class KGConstructor:
         # self.visited_user_ids = set()
         # self.visited_org_ids = set()
 
+    def rate_limit_check(self):
+        """Check and enforce API rate limit: 1000 requests per 5 minutes"""
+        current_time = time.time()
+        elapsed = current_time - self.rate_limit_start
+        
+        if elapsed >= self.API_WINDOW_SECONDS:
+            # Reset window
+            self.api_requests = 0
+            self.rate_limit_start = current_time
+        
+        if self.api_requests >= self.API_RATE_LIMIT:
+            wait_time = self.API_WINDOW_SECONDS - elapsed
+            if wait_time > 0:
+                print(f"[Rate Limit] Reached {self.API_RATE_LIMIT} requests. Sleeping {wait_time:.1f}s...")
+                logging.info(f"[rate_limit] Sleeping {wait_time:.1f}s to respect API limits")
+                time.sleep(wait_time)
+                self.api_requests = 0
+                self.rate_limit_start = time.time()
+    
+    def track_api_request(self):
+        """Track API request for rate limiting"""
+        self.api_requests += 1
+        self.rate_limit_check()
+
+    @staticmethod
+    def _parse_datetime(value):
+        """Parse datetime from multiple input formats: datetime object, ISO string, or Unix timestamp"""
+        if value is None:
+            return None
+        
+        # Already a datetime object
+        if isinstance(value, datetime):
+            # Ensure it's timezone-naive for comparison
+            if value.tzinfo is not None:
+                return value.replace(tzinfo=None)
+            return value
+        
+        # Unix timestamp (int or float)
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(value)
+        
+        # ISO format string
+        if isinstance(value, str):
+            # Try ISO format first
+            for fmt in ['%Y-%m-%dT%H:%M:%S.%fZ', '%Y-%m-%dT%H:%M:%S.%f', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%d']:
+                try:
+                    dt = datetime.strptime(value, fmt)
+                    return dt
+                except ValueError:
+                    continue
+            # Fallback: try parsing as-is
+            raise ValueError(f"Cannot parse datetime: {value}")
+        
+        return value
+
+    def load_previous_data(self):
+        """Load previous data structures from a snapshot directory"""
+        if not os.path.exists(self.previous_data_dir):
+            logging.warning(f"Previous data dir not found: {self.previous_data_dir}")
+            return
+        
+        logging.info(f"Loading previous entities from {self.previous_data_dir}...")
+        
+        # Map of entity types to load
+        entity_files = {
+            'tasks': self.processed_tasks,
+            'models': self.processed_models,
+            'datasets': self.processed_datasets,
+            'spaces': self.processed_spaces,
+            'papers': self.processed_papers,
+            'collections': self.processed_collections,
+            'users': self.processed_users,
+            'orgs': self.processed_orgs
+        }
+        
+        for entity_type, entity_list in entity_files.items():
+            filepath = os.path.join(self.previous_data_dir, f'{entity_type}.json')
+            if os.path.exists(filepath):
+                try:
+                    with open(filepath, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                        entity_list.extend(data)
+                        logging.info(f"Loaded {len(data)} {entity_type} from previous snapshot")
+                except Exception as e:
+                    print(f"Error loading {entity_type} from {filepath}: {e}")
+                    logging.error(f"Failed to load {entity_type}: {e}")
+    
+    def is_new_or_updated(self, entity):
+        """Check if entity is new or updated after the cutoff date"""
+        if not self.cutoff_datetime:
+            return True  # No cutoff, include everything
+        
+        # Check createdAt
+        if 'createdAt' in entity:
+            created_at = self._parse_datetime(entity['createdAt'])
+            if created_at and created_at > self.cutoff_datetime:
+                return True
+        
+        # Check lastModified
+        if 'lastModified' in entity:
+            last_modified = self._parse_datetime(entity['lastModified'])
+            if last_modified and last_modified > self.cutoff_datetime:
+                return True
+        
+        # Check updated_at (alternative field)
+        if 'updated_at' in entity:
+            updated_at = self._parse_datetime(entity['updated_at'])
+            if updated_at and updated_at > self.cutoff_datetime:
+                return True
+        
+        return False
+
+    def json_serializer(self, obj):
+        if isinstance(obj, (datetime, date)):
+            return obj.isoformat()
+        return str(obj)
+
     def save_data(self, filename, data):
         """Helper method to save data to JSON file"""
         with open(os.path.join(self.output_dir, f'{filename}.json'), 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=4)
+            json.dump(data, f, indent=4, default=self.json_serializer)
+
+    def save_batch_data(self, entity_type):
+        """Save batched entity data to allow partial progress"""
+        batch_file = os.path.join(self.output_dir, f'{entity_type}_batch.json')
+        data_map = {
+            'models': self.processed_models,
+            'datasets': self.processed_datasets,
+            'spaces': self.processed_spaces,
+            'tasks': self.processed_tasks
+        }
+        if entity_type in data_map:
+            with open(batch_file, 'w', encoding='utf-8') as f:
+                json.dump(data_map[entity_type], f, indent=4, default=self.json_serializer)
+            logging.info(f"[batch] Saved {len(data_map[entity_type])} {entity_type} (batch checkpoint)")
+
 
     def save_entity_data(self):
         print("Saving entity data...")
@@ -546,17 +683,41 @@ class KGConstructor:
     def process_model_data(self):
         print(f"Preparing model data...")
         tag_mapping = self.get_tag_classification('model')
-        models = list_models(full=True, limit=1000)
         
-        print(f"Processing models...")
-        for model in tqdm(models):
+        print(f"Processing models with pagination, date filtering, and rate limiting...")
+        models = list_models(full=True)
+        
+        batch_count = 0
+        skipped_count = 0
+        for idx, model in enumerate(tqdm(models, desc="Models"), 1):
+            # Rate limiting check
+            self.track_api_request()
+            
+            # Incremental update: skip if not new/updated
+            if self.cutoff_datetime and not self.is_new_or_updated(vars(model)):
+                skipped_count += 1
+                continue
+            
             model_data = self.get_model_details(model, tag_mapping)
             self.processed_models.append(model_data)
+            
+            # Batch save every BATCH_SIZE entities
+            if len(self.processed_models) % self.BATCH_SIZE == 0:
+                batch_count += 1
+                print(f"\n[Batch {batch_count}] Saving {len(self.processed_models)} models to disk...")
+                self.save_batch_data('models')
+                logging.info(f"[batch] Batch {batch_count}: {len(self.processed_models)} models")
         
-        # Save model related data
-        print(f"Saving model data...")
+        # Save final batch
+        print(f"Saving final batch ({len(self.processed_models)} models)...")
         self.save_model_data()
         self.model_ids = {model['id'] for model in self.processed_models}
+        if self.cutoff_datetime:
+            print(f"Model processing complete: {len(self.processed_models)} new/updated, {skipped_count} skipped (unchanged)")
+        else:
+            print(f"Model processing complete: {len(self.processed_models)} total")
+        logging.info(f"[models] Processed {len(self.processed_models)} models, skipped {skipped_count}")
+
 
     def get_model_description(self, model):
         try:
@@ -677,17 +838,41 @@ class KGConstructor:
     def process_dataset_data(self):
         print(f"Preparing dataset data...")
         tag_mapping = self.get_tag_classification('dataset')
-        datasets = list_datasets(full=True, limit=1000)
 
-        print(f"Processing datasets...")
-        for dataset in tqdm(datasets):
+        print(f"Processing datasets with pagination, date filtering, and rate limiting...")
+        datasets = list_datasets(full=True)
+
+        batch_count = 0
+        skipped_count = 0
+        for idx, dataset in enumerate(tqdm(datasets, desc="Datasets"), 1):
+            # Rate limiting check
+            self.track_api_request()
+            
+            # Incremental update: skip if not new/updated
+            if self.cutoff_datetime and not self.is_new_or_updated(vars(dataset)):
+                skipped_count += 1
+                continue
+            
             dataset_data = self.get_dataset_details(dataset, tag_mapping)
             self.processed_datasets.append(dataset_data)
+            
+            # Batch save every BATCH_SIZE entities
+            if len(self.processed_datasets) % self.BATCH_SIZE == 0:
+                batch_count += 1
+                print(f"\n[Batch {batch_count}] Saving {len(self.processed_datasets)} datasets to disk...")
+                self.save_batch_data('datasets')
+                logging.info(f"[batch] Batch {batch_count}: {len(self.processed_datasets)} datasets")
         
-        # Save dataset related data
-        print(f"Saving dataset data...")
+        # Save final batch
+        print(f"Saving final batch ({len(self.processed_datasets)} datasets)...")
         self.save_dataset_data()
         self.dataset_ids = {dataset['id'] for dataset in self.processed_datasets}
+        if self.cutoff_datetime:
+            print(f"Dataset processing complete: {len(self.processed_datasets)} new/updated, {skipped_count} skipped (unchanged)")
+        else:
+            print(f"Dataset processing complete: {len(self.processed_datasets)} total")
+        logging.info(f"[datasets] Processed {len(self.processed_datasets)} datasets, skipped {skipped_count}")
+
 
     def get_dataset_description(self, dataset):
         try:
@@ -779,22 +964,34 @@ class KGConstructor:
 
     def process_space_data(self):
         print(f"Preparing space data...")
-        spaces = list_spaces(limit=1000)
+        spaces = list_spaces()
         space_ids = [space.id for space in tqdm(spaces)]
         
-        print(f"Processing spaces...")
+        print(f"Processing spaces with date filtering...")
         with concurrent.futures.ThreadPoolExecutor() as executor:
             results = list(tqdm(
                 executor.map(self.get_space_details, space_ids),
                 total=len(space_ids)
             ))
 
-        self.processed_spaces = [space for space in results if space is not None]
+        # Filter by cutoff date
+        skipped_count = 0
+        for space in results:
+            if space is not None:
+                if self.cutoff_datetime and not self.is_new_or_updated(space):
+                    skipped_count += 1
+                    continue
+                self.processed_spaces.append(space)
         
         # Save space related data
         print(f"Saving space data...")
         self.save_space_data()
         self.space_ids = {space['id'] for space in self.processed_spaces}
+        if self.cutoff_datetime:
+            print(f"Space processing complete: {len(self.processed_spaces)} new/updated, {skipped_count} skipped (unchanged)")
+        else:
+            print(f"Space processing complete: {len(self.processed_spaces)} total")
+        logging.info(f"[spaces] Processed {len(self.processed_spaces)} spaces, skipped {skipped_count}")
 
     def get_collection_details(self, collection_slug):
         try:
@@ -909,7 +1106,7 @@ class KGConstructor:
 
     def process_collection_data(self):
         print(f"Preparing collection data...")
-        collection_slugs = self.get_collection_slugs(limit=100)
+        collection_slugs = self.get_collection_slugs()
 
         print(f"Processing collections...")
         with concurrent.futures.ThreadPoolExecutor() as executor:
